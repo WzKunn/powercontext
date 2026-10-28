@@ -952,6 +952,47 @@ class RelationalContexts:
                 )
         return pending is not None
 
+    async def pending_source_count(
+        self,
+        scope_id: str,
+        binding_name: str,
+        /,
+    ) -> tuple[int, bool]:
+        """Return the pending Source count of one family and its request state.
+
+        The count is the number of journal entries after the family's last
+        successful cursor, so it counts persisted Source identities and not
+        text length or generated results.
+        """
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            head = await self.repositories.sources.journal_position(connection, scope)
+            cursor = await self.repositories.cursors.load(connection, scope, binding_name)
+            intent = await ArtifactProcessingIntentRepository().load(connection, scope, binding_name)
+        sequence = 0 if cursor is None else int(cursor.cursor.sequence)
+        requested = intent is not None and intent.requested_generation > intent.handled_generation
+        return max(0, int(head) - sequence), requested
+
+    async def request_source_count_trigger(
+        self,
+        scope_id: str,
+        binding_name: str,
+        /,
+    ) -> bool:
+        """Accept one processing request for a scope whose count reached its threshold."""
+
+        scope = validate_scope_id(scope_id)
+        async with self.database.transaction() as connection:
+            pending = await self.repositories.processing_pending.request_flush(
+                connection,
+                scope,
+                binding_name,
+            )
+            if pending is not None:
+                await ArtifactProcessingIntentRepository().request(connection, scope, binding_name)
+        return pending is not None
+
     async def browse_topic_memories(
         self,
         scope_id: str,

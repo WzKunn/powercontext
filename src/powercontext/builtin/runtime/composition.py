@@ -17,10 +17,11 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from contextlib import AsyncExitStack, asynccontextmanager, nullcontext
+from contextlib import AsyncExitStack, asynccontextmanager, nullcontext, suppress
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -140,6 +141,7 @@ from powercontext.builtin.runtime.decision_model import (
 from powercontext.builtin.runtime.family_processing import FAMILY_BINDINGS, FamilyWorkerSpec, run_family_worker
 from powercontext.builtin.runtime.memory_write_gate import build_memory_write_gate
 from powercontext.builtin.runtime.models import MemorySearchMode, RuntimeCapabilities
+from powercontext.builtin.triggers import SOURCE_WINDOW_TRIGGER_NAME
 from powercontext.builtin.runtime.processing_discovery import SourceProcessingPendingProvider, enabled_profile_scopes
 from powercontext.builtin.runtime.processing_registry import (
     canonical_processing_manifest,
@@ -656,6 +658,9 @@ async def open_builtin_runtime(
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )
+        await resources.enter_async_context(
+            _open_source_count_trigger(config, contexts, runtime)
+        )
         contexts.profiles.operation_context = runtime._operation
         if config.handoff_report.enabled:
             runtime.handoff_report = HandoffReportApplication(
@@ -666,6 +671,87 @@ async def open_builtin_runtime(
             raise BuiltinConfigurationError("memory-reranker")
         _require_decision_backend(config.runtime, configured_decision)
         yield runtime
+
+
+_SOURCE_COUNT_TRIGGER_INTERVAL_SECONDS = 0.25
+
+
+@asynccontextmanager
+async def _open_source_count_trigger(
+    config: BuiltinConfig,
+    contexts: RelationalContexts,
+    runtime: BuiltinRuntime,
+) -> AsyncIterator[None]:
+    """Start the count based processing trigger when a threshold is configured.
+
+    The trigger counts the persisted Source entries that arrived after the
+    family's last successful cursor. Reaching the threshold requests one
+    ordinary processing call, so the time condition and the count condition
+    stay independent ways of starting the same work.
+    """
+
+    thresholds = {
+        SOURCE_WINDOW_TRIGGER_NAME: config.runtime.memory_source_count_threshold,
+        TOPIC_MEMORY_SOURCE_WINDOW_BINDING: config.runtime.topic_memory_source_count_threshold,
+    }
+    active = {binding: threshold for binding, threshold in thresholds.items() if threshold is not None}
+    if not active:
+        yield None
+        return
+    task = asyncio.create_task(_run_source_count_trigger(contexts, runtime, active))
+    try:
+        yield task
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def _run_source_count_trigger(
+    contexts: RelationalContexts,
+    runtime: BuiltinRuntime,
+    active: Mapping[str, int],
+) -> None:
+    """Request processing for every scope whose pending Source count is reached."""
+
+    while True:
+        try:
+            for scope_id in await contexts.scope_ids():
+                for binding_name, threshold in active.items():
+                    count, requested = await contexts.pending_source_count(scope_id, binding_name)
+                    if count < threshold or requested:
+                        continue
+                    if await contexts.request_source_count_trigger(scope_id, binding_name):
+                        _wake_processing_supervisor(runtime, binding_name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the trigger must survive a transient failure
+            log_safely(
+                logger,
+                logging.WARNING,
+                "Source count trigger failed",
+                exc_info=error,
+                extra={"event": "processing.count_trigger.failed", "outcome": "failure", "unit": "processing"},
+            )
+        await asyncio.sleep(_SOURCE_COUNT_TRIGGER_INTERVAL_SECONDS)
+
+
+def _wake_processing_supervisor(runtime: BuiltinRuntime, binding_name: str) -> None:
+    """Wake the processing supervisor so a requested window starts promptly."""
+
+    supervisor = runtime.artifact_processing_supervisor
+    if supervisor is None:
+        return
+    try:
+        supervisor.wake(binding_name)
+    except Exception as error:  # noqa: BLE001 - the supervisor may be closing
+        log_safely(
+            logger,
+            logging.WARNING,
+            "Processing supervisor wake failed after a count trigger",
+            exc_info=error,
+            extra={"event": "processing.count_trigger.wake_failed", "outcome": "failure", "unit": "processing"},
+        )
 
 
 def _validate_processing_source_registry(

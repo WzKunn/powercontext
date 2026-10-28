@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AnyHttpUrl,
@@ -137,6 +137,8 @@ class RuntimeConfig(BaseModel):
 
     scope_cache_size: int = Field(default=DEFAULT_SCOPE_CACHE_SIZE, ge=1)
     source_window_limit: int = Field(default=100, ge=1)
+    memory_source_count_threshold: Annotated[int, Field(strict=True, gt=0)] | None = None
+    topic_memory_source_count_threshold: Annotated[int, Field(strict=True, gt=0)] | None = None
     context_assembly_max_entries: int = Field(default=8, ge=1)
     memory_extraction_profile: MemoryExtractionProfile = MemoryExtractionProfile.CODING
     memory_rerank_enabled: bool = False

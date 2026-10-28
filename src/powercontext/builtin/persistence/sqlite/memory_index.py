@@ -365,6 +365,15 @@ class SQLiteMemoryFTSIndex:
         ).mappings()
         return MemorySearchChannels(fts=memory_channel_hits(rows, request.memories))
 
+    async def search_hybrid(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels | None:
+        return None
+
     async def vector_complete(
         self,
         connection: AsyncConnection,
@@ -573,6 +582,15 @@ class SQLiteMemoryVectorIndex:
             )
         ).mappings()
         return MemorySearchChannels(vector=memory_channel_hits(rows, request.memories))
+
+    async def search_hybrid(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels | None:
+        return None
 
     async def vector_complete(
         self,

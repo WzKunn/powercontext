@@ -100,6 +100,17 @@ class MemoryIndex(Protocol):
         /,
     ) -> MemorySearchChannels: ...
 
+    async def search_hybrid(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels | None:
+        """Return both channels from one native statement, or None when unsupported."""
+
+        ...
+
     async def vector_complete(
         self,
         connection: AsyncConnection,
@@ -165,6 +176,15 @@ class NoMemoryIndex:
         /,
     ) -> MemorySearchChannels:
         raise CapabilityNotSupportedError("fts")
+
+    async def search_hybrid(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels | None:
+        return None
 
     async def vector_complete(
         self,
@@ -247,6 +267,10 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid":
+            combined = await self._search_hybrid(connection, scope_id, request)
+            if combined is not None:
+                return combined
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:
@@ -254,6 +278,21 @@ class CompositeMemoryIndex:
             fts += channels.fts
             vector += channels.vector
         return MemorySearchChannels(fts=fts, vector=vector)
+
+    async def _search_hybrid(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels | None:
+        """Return both channels from one native statement when an index can."""
+
+        for index in self.indexes:
+            combined = await index.search_hybrid(connection, scope_id, request)
+            if combined is not None:
+                return combined
+        return None
 
     async def vector_complete(
         self,

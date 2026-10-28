@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
 from typing import TypeVar
@@ -329,7 +330,9 @@ class PreparedContextBuilder:
     ) -> list[tuple[PreparedContextFragment, dict[str, object]]]:
         """Rank the literal fragments of the candidates by their query overlap."""
 
-        scored: list[tuple[int, int, int, PreparedContextFragment, dict[str, object]]] = []
+        corpus = [hit.text for candidates in memory_candidates for hit in candidates.hits]
+        weights = _term_weights(terms, corpus)
+        scored: list[tuple[float, int, int, PreparedContextFragment, dict[str, object]]] = []
         for candidates in memory_candidates:
             scope_id = candidates.scope_id or current_scope_id
             if not scope_id:
@@ -350,7 +353,7 @@ class PreparedContextBuilder:
                 }
                 for index, (start, end) in enumerate(_literal_spans(hit.text)):
                     text = hit.text[start:end]
-                    score = _term_overlap(text, terms)
+                    score = _term_overlap(text, terms, weights)
                     if score <= 0:
                         continue
                     fragment = PreparedContextFragment(address=address, start=start, end=end, text=text)
@@ -765,20 +768,131 @@ class PreparedContextBuilder:
 _FRAGMENT_SENTENCE_PATTERN = re.compile(r"[^.!?。！？\n]*[.!?。！？]+|[^.!?。！？\n]+")
 _FRAGMENT_TERM_PATTERN = re.compile(r"[\w']+")
 _FRAGMENT_MAX_BYTES = 480
+_FRAGMENT_STOPWORDS = frozenset(
+    {
+        "a",
+        "about",
+        "after",
+        "all",
+        "also",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "may",
+        "might",
+        "more",
+        "most",
+        "not",
+        "of",
+        "on",
+        "or",
+        "other",
+        "our",
+        "out",
+        "over",
+        "said",
+        "same",
+        "should",
+        "shows",
+        "since",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "to",
+        "up",
+        "use",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "why",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+    }
+)
 
 
 def _query_terms(query: str) -> tuple[str, ...]:
-    """Return the distinct lowercase terms of one query."""
+    """Return the distinct informative lowercase terms of one query."""
 
     terms = (token.casefold() for token in _FRAGMENT_TERM_PATTERN.findall(query))
-    return tuple(dict.fromkeys(term for term in terms if len(term) > 1))
+    return tuple(
+        dict.fromkeys(term for term in terms if len(term) > 1 and term not in _FRAGMENT_STOPWORDS)
+    )
 
 
-def _term_overlap(text: str, terms: tuple[str, ...]) -> int:
-    """Count the distinct query terms that occur in one fragment."""
+def _term_weights(terms: tuple[str, ...], corpus: Sequence[str]) -> dict[str, float]:
+    """Weight every query term by how rare it is in the candidate corpus."""
 
+    if not terms:
+        return {}
+    document_frequency: dict[str, int] = {term: 0 for term in terms}
+    size = max(1, len(corpus))
+    for text in corpus:
+        folded = text.casefold()
+        for term in terms:
+            if _contains_term(folded, term):
+                document_frequency[term] += 1
+    return {
+        term: math.log(1 + size / (1 + document_frequency[term])) for term in terms
+    }
+
+
+def _contains_term(folded: str, term: str) -> bool:
+    """Return whether one whole term occurs in an already folded text."""
+
+    return re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", folded) is not None
+
+
+def _term_overlap(text: str, terms: tuple[str, ...], weights: Mapping[str, float]) -> float:
+    """Score one fragment by the rarity weighted query terms it states."""
+
+    if not terms:
+        return 0.0
     folded = text.casefold()
-    return sum(1 for term in terms if term in folded)
+    return sum(weight for term, weight in weights.items() if _contains_term(folded, term))
 
 
 def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:

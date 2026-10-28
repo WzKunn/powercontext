@@ -18,6 +18,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
+import re
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Protocol
 from urllib.parse import quote
 
@@ -182,6 +186,135 @@ class _ScopedMemory(Protocol):
     async def search(self, request: SearchMemoryRequest, /) -> Any: ...
 
 
+_PDF_QUERY_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "did",
+        "do",
+        "does",
+        "for",
+        "from",
+        "give",
+        "has",
+        "have",
+        "how",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "there",
+        "these",
+        "this",
+        "to",
+        "was",
+        "were",
+        "what",
+        "when",
+        "which",
+        "who",
+        "why",
+        "with",
+        "you",
+        "your",
+    }
+)
+_PDF_QUERY_TERM = re.compile(r"[a-z0-9]+")
+
+
+def _query_terms(question: str) -> tuple[str, ...]:
+    """Return the informative lowercase terms of one question."""
+
+    terms = (token for token in _PDF_QUERY_TERM.findall(question.casefold()))
+    return tuple(dict.fromkeys(token for token in terms if len(token) > 1 and token not in _PDF_QUERY_STOPWORDS))
+
+
+def _term_overlap(text: str, terms: tuple[str, ...]) -> float:
+    """Score how many distinct question terms one page actually states."""
+
+    if not terms:
+        return 0.0
+    folded = text.casefold()
+    matched = 0.0
+    for term in terms:
+        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", folded):
+            matched += 1.0
+    return matched / len(terms)
+
+
+def _term_window(text: str, terms: tuple[str, ...]) -> int:
+    """Return the smallest number of words that carries every matched term.
+
+    An evidence page usually states the question terms close to each other, so
+    a tight window separates the page that answers the question from a page
+    that merely repeats one common term somewhere else.
+    """
+
+    if not terms:
+        return 0
+    words = _PDF_QUERY_TERM.findall(text.casefold())
+    positions: dict[str, list[int]] = {}
+    for index, word in enumerate(words):
+        positions.setdefault(word, []).append(index)
+    matched = [positions[term] for term in terms if positions.get(term)]
+    if not matched:
+        return 0
+    best = len(words)
+    for start in matched[0]:
+        window = start
+        for group in matched[1:]:
+            window = min(window, min((item for item in group if item >= window), default=window))
+        end = max((max(group) for group in matched), default=start)
+        best = min(best, max(1, end - window + 1))
+    return best
+
+
+def _page_score(text: str, terms: tuple[str, ...], weights: Mapping[str, float]) -> float:
+    """Score one page by the rarity weighted question terms it states."""
+
+    if not terms:
+        return 0.0
+    folded = text.casefold()
+    coverage = 0.0
+    matched = 0
+    for term, weight in weights.items():
+        if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", folded):
+            coverage += weight
+            matched += 1
+    if not matched:
+        return 0.0
+    window = _term_window(text, terms)
+    tightness = 1.0 / (1.0 + math.log1p(window)) if window else 0.0
+    return coverage * (1.0 + tightness)
+
+
+def _term_weights(terms: tuple[str, ...], corpus: Sequence[str]) -> dict[str, float]:
+    """Weight every question term by how rare it is in the candidate pages."""
+
+    if not terms:
+        return {}
+    frequency: Counter[str] = Counter()
+    size = max(1, len(corpus))
+    for text in corpus:
+        folded = text.casefold()
+        for term in terms:
+            if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", folded):
+                frequency[term] += 1
+    return {term: math.log(1 + size / (1 + frequency[term])) for term in terms}
+
+
 async def search_pdf_pages(
     memory: _ScopedMemory,
     question: str,
@@ -191,19 +324,27 @@ async def search_pdf_pages(
 
     The search runs through the public Memory API, so every returned
     citation can be read back with :meth:`memory.get` and still names the
-    physical page it was captured from.
+    physical page it was captured from.  The coarse fulltext candidates are
+    re-ranked by the question terms they state, because a page that mentions
+    every term of the question is a better evidence page than the first page
+    that merely matches a common term.
     """
 
     if not isinstance(question, str) or not question.strip():
         raise ValueError("question must contain non-whitespace content")  # noqa: TRY003
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("limit must be a positive integer")  # noqa: TRY003
+    terms = _query_terms(question)
     page = await memory.search(
-        SearchMemoryRequest(query=question, mode="fts", limit=min(max(limit * 4, limit), 100))
+        SearchMemoryRequest(query=question, mode="fts", limit=min(max(limit * 10, 50), 200))
+    )
+    weights = _term_weights(terms, [hit.text for hit in page.hits])
+    ranked = sorted(
+        ((-_page_score(hit.text, terms, weights), rank, hit) for rank, hit in enumerate(page.hits)),
     )
     citations: list[MemoryCitation] = []
     seen: set[str] = set()
-    for hit in page.hits:
+    for _score, _rank, hit in ranked:
         if hit.entry_id in seen:
             continue
         seen.add(hit.entry_id)

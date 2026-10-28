@@ -21,6 +21,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import delete, insert, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection
 
 from powercontext.builtin.persistence.tables import SOURCE_LIFECYCLE_NODES_TABLE
@@ -91,7 +92,12 @@ class RelationalSourceLifecycle:
             table.c.kind == "topic",
             table.c.available.is_(False),
         )
-        rows = (await connection.execute(statement)).all()
+        try:
+            rows = (await connection.execute(statement)).all()
+        except SQLAlchemyError:
+            # A database created before the lifecycle table existed simply has no
+            # withdrawn topics; the search must keep working on it.
+            return frozenset()
         artifacts: set[str] = set()
         for row in rows:
             reference = json.loads(row[0])

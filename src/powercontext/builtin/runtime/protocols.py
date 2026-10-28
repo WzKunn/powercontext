@@ -21,6 +21,7 @@ from contextlib import AbstractContextManager
 from typing import Protocol, TypeVar
 
 from powercontext.builtin.artifacts.handoff import ActivateHandoff, HandoffActivation
+from powercontext.builtin.persistence.source_lifecycle import SourceLifecycleNode
 from powercontext.builtin.runtime.models import (
     CommitConnectorCheckpoint,
     ConnectorCheckpointState,
@@ -69,6 +70,14 @@ class PowerContextProvider(Protocol[SourcesT, ArtifactsT, TriggersT]):
     """Resolve an already composed context without transferring lifecycle ownership."""
 
     async def get(self, scope_id: str, /) -> PowerContext[SourcesT, ArtifactsT, TriggersT]: ...
+
+
+class SourceLifecycleService(Protocol):
+    """Persist the Source lifecycle graph of one scope."""
+
+    async def nodes(self, scope_id: str, /) -> tuple[SourceLifecycleNode, ...]: ...
+
+    async def save(self, scope_id: str, node: SourceLifecycleNode, /) -> None: ...
 
 
 class RemoteIngestion(Protocol):

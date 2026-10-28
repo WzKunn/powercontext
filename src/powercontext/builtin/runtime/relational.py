@@ -147,6 +147,7 @@ from powercontext.builtin.persistence.memory import RelationalMemoryBackend
 from powercontext.builtin.persistence.memory_index import MemoryIndex, NoMemoryIndex
 from powercontext.builtin.persistence.processing import ArtifactProcessingPendingRepository
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
+from powercontext.builtin.persistence.source_lifecycle import RelationalSourceLifecycle
 from powercontext.builtin.persistence.records import RelationalRecordService
 from powercontext.builtin.persistence.recurrence import RecurrenceRepository
 from powercontext.builtin.persistence.skill_packages import SkillPackageRepository
@@ -552,6 +553,7 @@ class RelationalContexts:
         self.scopes = ScopeApplication(database, cursor_secret=cursor_secret)
         self.source_registry = source_registry or BUILTIN_SOURCE_REGISTRY
         self.index = NoMemoryIndex() if index is None else index
+        self.source_lifecycle = RelationalSourceLifecycle(database)
         self.topic_memory_index = NoTopicMemoryIndex() if topic_memory_index is None else topic_memory_index
         self.experience_index = NoExperienceIndex() if experience_index is None else experience_index
         source_repository = SourceRepository(self.source_registry)
@@ -1032,7 +1034,7 @@ class RelationalContexts:
             embedding_profile = query_embedding.embedding_profile
         scope = validate_scope_id(scope_id)
         async with self.database.transaction() as connection:
-            return await self.repositories.topic_memories.search(
+            result = await self.repositories.topic_memories.search(
                 connection,
                 scope,
                 query,
@@ -1042,6 +1044,16 @@ class RelationalContexts:
                 embedding_profile=embedding_profile,
                 admission=admission,
             )
+            withdrawn = await self.source_lifecycle.unavailable_topic_ids(connection, scope)
+        if withdrawn:
+            result = result.model_copy(
+                update={
+                    "hits": tuple(
+                        hit for hit in result.hits if hit.artifact_ref.artifact_id not in withdrawn
+                    )
+                }
+            )
+        return result
 
     async def search_skills(
         self,

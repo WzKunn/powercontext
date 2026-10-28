@@ -604,6 +604,7 @@ async def open_builtin_runtime(
                 scope_evictor=contexts.evict,
                 scope_cache_observer=scope_cache_observer,
                 scope_ids=contexts.scope_ids,
+                source_lifecycle=contexts.source_lifecycle,
                 review_service=contexts.review,
                 profiles=contexts.profiles,
                 subject_sources=contexts.subject_sources,

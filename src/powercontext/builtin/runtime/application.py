@@ -166,6 +166,11 @@ from powercontext.builtin.runtime._scope_cache import (
     ScopeCacheObserver,
     ScopeEvictor,
 )
+from powercontext.builtin.runtime.context_pack import (
+    ContextPack,
+    ContextPackDelta,
+    incremental_context_pack,
+)
 from powercontext.builtin.runtime.decision_model import DecisionModel
 from powercontext.builtin.runtime.errors import InvalidRuntimeRequestError, TopicMemoryProcessingUnavailableError
 from powercontext.builtin.runtime.models import (
@@ -846,6 +851,24 @@ class ScopedContextApplication:
             if authorize_scopes is not None:
                 await authorize_scopes((self.scope_id, *scope.context_references))
             return await self._prepare(request, scope)
+
+    async def prepare_incremental(
+        self,
+        request: PrepareContextRequest,
+        base_pack: ContextPack | None = None,
+        *,
+        authorize_scopes: Callable[[tuple[str, ...]], Awaitable[None]] | None = None,
+    ) -> ContextPack | ContextPackDelta:
+        """Prepare the context and return a complete pack or an incremental delta.
+
+        Without a base pack the caller receives the complete Context Pack of the
+        prepared content.  With a base pack the caller receives the delta that
+        rebuilds exactly the same content from that base, so the receiver never
+        needs the sender's process state.
+        """
+
+        prepared = await self.prepare(request, authorize_scopes=authorize_scopes)
+        return incremental_context_pack(base_pack, prepared.content or "")
 
     async def _prepare(self, request: PrepareContextRequest, scope: ScopeDescriptor, /) -> PreparedContext:
         build, effort = await self._prepare_build(request, scope)

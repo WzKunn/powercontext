@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -106,6 +107,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +117,20 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal fragment of a Memory entry selected for the current query.
+
+    ``text`` is exactly ``entry.text[start:end]`` of the addressed entry
+    version, so every fragment can be checked against the original record.
+    """
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,6 +251,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection and request.assembly is None:
+            return self._build_fragments(
+                request=request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -255,6 +278,85 @@ class PreparedContextBuilder:
             origins=origins,
             omissions=omissions,
         )
+
+    def _build_fragments(
+        self,
+        *,
+        request: PrepareContextRequest,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Select the query-relevant literal fragments of the Memory candidates.
+
+        The fragments are taken verbatim from the entry text, so every
+        delivered fragment can be checked against the original record by its
+        citation and character range.
+        """
+
+        terms = _query_terms(request.query)
+        scored = self._scored_fragments(
+            terms,
+            current_scope_id=current_scope_id,
+            memory_candidates=memory_candidates,
+        )
+        if not scored:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        items: list[dict[str, object]] = []
+        fragments: list[PreparedContextFragment] = []
+        for fragment, citation in scored:
+            candidate = [*items, _render_fragment(fragment, citation)]
+            if len(_render_fragments(candidate).encode("utf-8")) > request.max_bytes:
+                continue
+            items.append(_render_fragment(fragment, citation))
+            fragments.append(fragment)
+            if len(items) >= self.entry_limit:
+                break
+        if not fragments:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_fragments(items)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(fragment.address for fragment in fragments),
+            fragments=tuple(fragments),
+        )
+
+    def _scored_fragments(
+        self,
+        terms: tuple[str, ...],
+        *,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> list[tuple[PreparedContextFragment, dict[str, object]]]:
+        """Rank the literal fragments of the candidates by their query overlap."""
+
+        scored: list[tuple[int, int, int, PreparedContextFragment, dict[str, object]]] = []
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id
+            if not scope_id:
+                continue
+            for rank, hit in enumerate(candidates.hits):
+                if not hit.text.strip():
+                    continue
+                address = MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+                citation = {
+                    "scope_id": scope_id,
+                    "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                    "entry_id": hit.entry_id,
+                    "entry_version_id": hit.entry_version_id,
+                }
+                for index, (start, end) in enumerate(_literal_spans(hit.text)):
+                    text = hit.text[start:end]
+                    score = _term_overlap(text, terms)
+                    if score <= 0:
+                        continue
+                    fragment = PreparedContextFragment(address=address, start=start, end=end, text=text)
+                    scored.append((-score, rank, index, fragment, citation))
+        scored.sort(key=lambda item: item[:3])
+        return [(fragment, citation) for _score, _rank, _index, fragment, citation in scored]
 
     def probe_budget(
         self,
@@ -658,6 +760,79 @@ class PreparedContextBuilder:
         if best is None:
             return _EntryFit(dropped_no_fitting_truncation=True)
         return _EntryFit(entry=best)
+
+
+_FRAGMENT_SENTENCE_PATTERN = re.compile(r"[^.!?。！？\n]*[.!?。！？]+|[^.!?。！？\n]+")
+_FRAGMENT_TERM_PATTERN = re.compile(r"[\w']+")
+_FRAGMENT_MAX_BYTES = 480
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    """Return the distinct lowercase terms of one query."""
+
+    terms = (token.casefold() for token in _FRAGMENT_TERM_PATTERN.findall(query))
+    return tuple(dict.fromkeys(term for term in terms if len(term) > 1))
+
+
+def _term_overlap(text: str, terms: tuple[str, ...]) -> int:
+    """Count the distinct query terms that occur in one fragment."""
+
+    folded = text.casefold()
+    return sum(1 for term in terms if term in folded)
+
+
+def _literal_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Split one entry text into literal spans with their character offsets."""
+
+    spans: list[tuple[int, int]] = []
+    for match in _FRAGMENT_SENTENCE_PATTERN.finditer(text):
+        raw = match.group()
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        start = match.start() + raw.index(stripped)
+        spans.extend(_split_long_span(text, start, start + len(stripped)))
+    return tuple(spans)
+
+
+def _split_long_span(text: str, start: int, end: int) -> list[tuple[int, int]]:
+    """Split one long span into word aligned pieces within the byte limit."""
+
+    if len(text[start:end].encode("utf-8")) <= _FRAGMENT_MAX_BYTES:
+        return [(start, end)]
+    pieces: list[tuple[int, int]] = []
+    cursor = start
+    while cursor < end:
+        limit = cursor
+        while limit < end and len(text[cursor:limit].encode("utf-8")) <= _FRAGMENT_MAX_BYTES:
+            limit += 1
+        if limit == cursor:
+            limit = cursor + 1
+        boundary = text.rfind(" ", cursor, limit)
+        if boundary > cursor:
+            limit = boundary
+        pieces.append((cursor, limit))
+        cursor = limit
+    return pieces
+
+
+def _render_fragment(fragment: PreparedContextFragment, citation: dict[str, object]) -> dict[str, object]:
+    """Render one literal fragment as a prepared-context item."""
+
+    return {
+        "citation": citation,
+        "content": fragment.text,
+        "start": fragment.start,
+        "end": fragment.end,
+    }
+
+
+def _render_fragments(items: Sequence[dict[str, object]]) -> str:
+    """Render the literal fragments as one prepared-context envelope."""
+
+    envelope = {"trust": "untrusted_history", "items": list(items)}
+    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
 
 
 def _interleave(

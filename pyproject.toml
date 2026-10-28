@@ -22,6 +22,7 @@ keywords = ['python']
 requires-python = ">=3.11,<4.0"
 dependencies = [
     "pydantic>=2.10,<3",
+    "pypdf>=6,<7",
     "rfc8785>=0.1.4,<1",
     "typing-extensions>=4.12,<5",
 ]
